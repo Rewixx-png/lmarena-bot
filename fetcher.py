@@ -26,8 +26,8 @@ USER_AGENTS = [
 TEXT_SLUG_MARKER = "text-overall-style_control/leaderboard-snapshots/latest"
 
 ANON_RE = re.compile(
-    r"(mystery|anonymous|anon\b|im[-_]also|gpt2[-_]?chatbot|test[-_]?chatbot|"
-    r"chatbot[-_]?test|secret[-_]?chatbot|hidden|unknown[-_]?model)",
+    r"(mystery|anonymous|anon\b|im[-_]also|gpt2[-_]?chatbot|chatbot[-_]?\d|"
+    r"test[-_]?chatbot|chatbot[-_]?test|secret[-_]?chatbot|hidden|unknown[-_]?model)",
     re.IGNORECASE,
 )
 
@@ -174,7 +174,10 @@ def _normalize_entry(entry, cap_map) -> dict:
     model_key = entry.get("modelKey") or ""
     display_name = entry.get("modelDisplayName") or model_key
     caps = _lookup_capabilities(cap_map, model_key, display_name)
-    anon = bool(ANON_RE.search(display_name) or ANON_RE.search(model_key))
+    # Anonymity follows the *displayed* name: arena keeps an anonymous-style
+    # modelKey (e.g. `august26-chatbot1-fmme`) even after the model is revealed,
+    # so keying off modelKey would mislabel de-anonymized models.
+    anon = bool(ANON_RE.search(display_name))
     return {
         "model_key": model_key,
         "display_name": display_name,

@@ -82,6 +82,14 @@ async def do_check(notify: bool = True) -> list:
         entries = snap["entries"]
         new = {m["model_key"]: m for m in entries}
         old = await db.get_all_models()
+
+        # Guard against a partial/truncated parse: diffing it would mass-report
+        # REMOVED and prune half the board.
+        if old and len(entries) < max(20, len(old) // 2):
+            raise FetchError(
+                f"suspiciously small snapshot ({len(entries)} vs {len(old)} stored) — skipped"
+            )
+
         events = diff(old, new, settings)
 
         now_iso = _now_iso()

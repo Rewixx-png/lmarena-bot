@@ -131,6 +131,15 @@ class Database:
                 ts, ts, json.dumps(m, ensure_ascii=False),
             ))
         await self.conn.executemany(_INSERT_SQL, rows)
+
+        # The table mirrors the current board: drop models that left it.
+        # Without this a departed model is re-reported as REMOVED on every check.
+        if entries:
+            keys = [m["model_key"] for m in entries]
+            placeholders = ",".join("?" * len(keys))
+            await self.conn.execute(
+                f"DELETE FROM models WHERE model_key NOT IN ({placeholders})", keys
+            )
         await self.conn.commit()
 
     async def record_history(self, ts: str, event_type: str, model_key: str,
