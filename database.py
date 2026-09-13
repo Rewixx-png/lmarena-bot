@@ -33,6 +33,13 @@ CREATE TABLE IF NOT EXISTS history (
     details      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts);
+CREATE TABLE IF NOT EXISTS subscribers (
+    chat_id   INTEGER PRIMARY KEY,
+    chat_type TEXT,
+    title     TEXT,
+    added_at  TEXT NOT NULL,
+    active    INTEGER DEFAULT 1
+);
 """
 
 _COLS = (
@@ -134,3 +141,31 @@ class Database:
             (ts, event_type, model_key, display_name, json.dumps(details, ensure_ascii=False)),
         )
         await self.conn.commit()
+
+    # --- subscribers (broadcast targets) ---
+
+    async def add_subscriber(self, chat_id: int, chat_type: str, title: str, ts: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO subscribers (chat_id, chat_type, title, added_at, active) "
+            "VALUES (?,?,?,?,1) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "chat_type=excluded.chat_type, title=excluded.title, active=1",
+            (chat_id, chat_type, title, ts),
+        )
+        await self.conn.commit()
+
+    async def remove_subscriber(self, chat_id: int) -> None:
+        await self.conn.execute("UPDATE subscribers SET active=0 WHERE chat_id=?", (chat_id,))
+        await self.conn.commit()
+
+    async def get_subscribers(self) -> list[int]:
+        async with self.conn.execute("SELECT chat_id FROM subscribers WHERE active=1") as cur:
+            rows = await cur.fetchall()
+        return [r["chat_id"] for r in rows]
+
+    async def count_subscribers(self) -> int:
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS n FROM subscribers WHERE active=1"
+        ) as cur:
+            row = await cur.fetchone()
+        return row["n"]

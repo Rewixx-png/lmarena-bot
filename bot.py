@@ -1,7 +1,8 @@
 """LM Arena monitoring Telegram bot (aiogram v3).
 
-Periodically polls the arena leaderboard, diffs snapshots, and posts change
-events to a channel and/or an admin chat. Provides interactive commands.
+Periodically polls the arena leaderboard, diffs snapshots, and broadcasts
+change events to every subscribed chat (anyone who sent /start or added the
+bot to a chat). Provides interactive commands.
 """
 import asyncio
 import logging
@@ -10,8 +11,9 @@ from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message
+from aiogram.types import ChatMemberUpdated, Message
 
 from config import parse_chat_id, settings
 from database import Database
@@ -39,24 +41,36 @@ state = {
 HELP_TEXT = (
     "🤖 <b>LM Arena Монитор</b>\n\n"
     "Слежу за лидербордом <a href=\"https://arena.ai/leaderboard\">LM Arena</a> "
-    "и сообщаю о новых моделях, деанонимизации и изменениях рейтинга.\n\n"
+    "и присылаю новости: новые модели, деанонимизация, изменения рейтинга.\n\n"
     "<b>Команды:</b>\n"
     "/status — статус мониторинга\n"
     "/top — топ-10 моделей прямо сейчас\n"
     "/check — принудительная проверка\n"
-    "/find &lt;имя&gt; — поиск карточки модели"
+    "/find &lt;имя&gt; — поиск карточки модели\n"
+    "/stop — отключить уведомления\n\n"
+    "Ты подписан на уведомления: этот чат добавлен в рассылку."
 )
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 async def send_notification(text: str) -> None:
-    targets = []
+    """Broadcast to every subscribed chat (+ optional channel/admin from env)."""
+    targets: set = set(await db.get_subscribers())
     for raw in (settings.channel_id, settings.admin_chat_id):
         cid = parse_chat_id(raw)
-        if cid:
-            targets.append(cid)
-    for cid in dict.fromkeys(targets):
+        if cid is not None:
+            targets.add(cid)
+
+    for cid in targets:
         try:
             await _bot.send_message(cid, text, disable_web_page_preview=True)
+            await asyncio.sleep(0.05)  # stay under Telegram's broadcast rate limit
+        except TelegramForbiddenError:
+            await db.remove_subscriber(cid)
+            log.info("deactivated subscriber %s (blocked/kicked)", cid)
         except Exception as e:  # noqa: BLE001
             log.warning("send to %s failed: %s", cid, e)
 
@@ -70,7 +84,7 @@ async def do_check(notify: bool = True) -> list:
         old = await db.get_all_models()
         events = diff(old, new, settings)
 
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = _now_iso()
         await db.upsert_models(entries, now_iso)
         for ev in events:
             details = {
@@ -121,6 +135,35 @@ async def poller() -> None:
             log.error("check failed: %s", e)
 
 
+# --- subscription tracking ----------------------------------------------------
+
+@router.message.middleware()
+async def track_chat(handler, event: Message, data):
+    """Subscribe any chat that interacts with the bot (except via /stop)."""
+    if not (event.text or "").lstrip().startswith("/stop"):
+        try:
+            title = event.chat.title or event.chat.full_name or ""
+            await db.add_subscriber(event.chat.id, event.chat.type, title, _now_iso())
+        except Exception as e:  # noqa: BLE001 - never break command handling
+            log.warning("subscribe failed for %s: %s", event.chat.id, e)
+    return await handler(event, data)
+
+
+@router.my_chat_member()
+async def on_my_chat_member(update: ChatMemberUpdated) -> None:
+    status = str(update.new_chat_member.status)
+    chat = update.chat
+    if status in ("member", "administrator", "creator"):
+        title = chat.title or chat.full_name or ""
+        await db.add_subscriber(chat.id, chat.type, title, _now_iso())
+        log.info("subscribed %s (%s)", chat.id, title or chat.type)
+    elif status in ("left", "kicked"):
+        await db.remove_subscriber(chat.id)
+        log.info("unsubscribed %s", chat.id)
+
+
+# --- commands -----------------------------------------------------------------
+
 def _summarize(events: list) -> str:
     counts = {NEW_MODEL: 0, DEANONYMIZED: 0, RENAMED: 0, REMOVED: 0, STATS_UPDATE: 0}
     for ev in events:
@@ -144,6 +187,12 @@ async def start(message: Message) -> None:
     await message.answer(HELP_TEXT)
 
 
+@router.message(Command("stop"))
+async def stop(message: Message) -> None:
+    await db.remove_subscriber(message.chat.id)
+    await message.answer("🔕 Уведомления отключены. Чтобы снова подписаться — /start")
+
+
 @router.message(Command("status"))
 async def status(message: Message) -> None:
     last = state["last_check_at"]
@@ -155,6 +204,7 @@ async def status(message: Message) -> None:
         f"Последняя проверка: <b>{last_str}</b>",
         f"Снапшот арены: <b>{esc(state['last_snapshot_ts'])}</b>",
         f"Моделей на доске: <b>{state['last_model_count']}</b>",
+        f"Подписчиков: <b>{await db.count_subscribers()}</b>",
         f"Интервал: <b>{settings.check_interval_seconds} с</b>",
     ]
     if state["last_error"]:
